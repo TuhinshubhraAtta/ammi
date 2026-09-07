@@ -1,37 +1,13 @@
 """
-Adaptive Micro-Manifold Imputer (AMMI) Core Engine
-==================================================
-Handles Pandas DataFrames, NumPy ndarrays, and Pure Python Lists transparently.
+Adaptive Micro-Manifold Imputer (AMMI)
+======================================
+High-performance, linear-time missing value imputation using orthonormal random
+projection slicing, hierarchical empirical Bayes shrinkage, and correlation-weighted
+residual projection.
 """
 
-import math
-import random
-from typing import List, Tuple, Optional, Any, Dict, Union
-
-# Optional Scikit-Learn Integration
-try:
-    from sklearn.base import BaseEstimator, TransformerMixin
-except ImportError:
-    class BaseEstimator:
-        """Fallback when scikit-learn is not installed."""
-        def get_params(self, deep=True):
-            return {}
-        def set_params(self, **params):
-            for k, v in params.items():
-                setattr(self, k, v)
-            return self
-
-    class TransformerMixin:
-        """Fallback when scikit-learn is not installed."""
-        def fit_transform(self, X, y=None, **fit_params):
-            return self.fit(X, y, **fit_params).transform(X)
-
-# Optional NumPy and Pandas detection
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
+from typing import Any, Dict, List, Optional, Tuple, Union
+import numpy as np
 
 try:
     import pandas as pd
@@ -39,248 +15,339 @@ try:
 except ImportError:
     HAS_PANDAS = False
 
-
-def is_missing(val: Any) -> bool:
-    """Checks if value is None, NaN, or non-finite."""
-    if val is None:
-        return True
-    if isinstance(val, (int, float)) and math.isnan(val):
-        return True
-    return False
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted
 
 
 class AdaptiveMicroManifoldImputer(BaseEstimator, TransformerMixin):
     """
-    Adaptive Micro-Manifold Imputer (AMMI)
-    --------------------------------------
-    A linear-time O(n) non-parametric imputation algorithm.
+    Adaptive Micro-Manifold Imputer (AMMI).
+
+    A non-parametric, linear-time tabular imputation estimator. AMMI partitions
+    continuous multidimensional feature spaces using orthonormal random hyperplanes,
+    aggregates local neighborhood cell statistics with empirical Bayes shrinkage,
+    and restores multivariate joint covariance via single-pass correlation-weighted
+    residual projection.
 
     Parameters
     ----------
     n_projections : int, default=4
-        Number of orthonormal random unit hyperplanes.
+        The number of orthonormal random projection directions used to slice
+        the manifold. Higher values yield more granular local neighborhoods
+        at the cost of exponentially sparser cells (n_bins ** n_projections).
     n_bins : int, default=4
-        Number of quantile-based subdivisions per projection slice.
+        Number of quantile-based subdivisions per projection axis.
     shrinkage_tau : float, default=3.0
-        Empirical Bayes James-Stein shrinkage parameter. Controls regularization
-        for sparse micro-manifold cells.
-    seed : int, default=42
-        Random seed for reproducibility.
+        Regularization pseudo-count for empirical Bayes cell shrinkage. Controls
+        how aggressively sparse micro-cells are smoothed toward global medians.
+        Higher values increase shrinkage toward the global marginal prior.
+    random_state : int or None, default=42
+        Determines random number generation for orthonormal projection generation.
+        Pass an int for reproducible output across multiple function calls.
+
+    Attributes
+    ----------
+    n_features_in_ : int
+        Number of features seen during :meth:`fit`.
+    feature_names_in_ : ndarray of shape (n_features_in_,), dtype=object
+        Names of features seen during :meth:`fit`. Defined only when `X`
+        has feature names that are all strings (e.g., pandas DataFrame).
+    global_medians_ : ndarray of shape (n_features_in_,)
+        Robust central tendencies (column medians) learned on observed entries.
+    global_stds_ : ndarray of shape (n_features_in_,)
+        Standard deviations of observed entries per feature.
+    projection_matrix_ : ndarray of shape (n_features_in_, n_projections)
+        Orthonormal basis matrix generated via QR decomposition.
+    bin_edges_ : List[ndarray]
+        Quantile bin boundary coordinates for each projection axis.
+    corr_matrix_ : ndarray of shape (n_features_in_, n_features_in_)
+        Empirical Pearson correlation matrix computed over observed pairwise data.
+    cell_means_ : Dict[Tuple[int, ...], ndarray]
+        Mean feature values for each partitioned micro-manifold cell.
+    cell_counts_ : Dict[Tuple[int, ...], ndarray]
+        Counts of observed samples for each feature within each cell.
     """
+
     def __init__(
         self,
         n_projections: int = 4,
         n_bins: int = 4,
         shrinkage_tau: float = 3.0,
-        seed: int = 42
+        random_state: Optional[int] = 42,
     ):
         self.n_projections = n_projections
         self.n_bins = n_bins
         self.shrinkage_tau = shrinkage_tau
-        self.seed = seed
+        self.random_state = random_state
 
-        # Learned statistical state
-        self.global_medians_: List[float] = []
-        self.global_stds_: List[float] = []
-        self.projection_matrix_: List[List[float]] = []
-        self.bin_edges_: List[List[float]] = []
-        self.corr_matrix_: List[List[float]] = []
-        self.cell_means_: Dict[Tuple[int, ...], List[float]] = {}
-        self.cell_counts_: Dict[Tuple[int, ...], List[int]] = {}
-        self.feature_names_: Optional[List[str]] = None
-
-    def _convert_input(self, X: Any) -> Tuple[List[List[Optional[float]]], str, Any]:
-        """Converts input to standard 2D list while remembering original type metadata."""
+    def _convert_input(self, X: Any) -> Tuple[np.ndarray, str, Any]:
+        """Validates and converts input data into a 2D float64 NumPy array."""
         if HAS_PANDAS and isinstance(X, pd.DataFrame):
-            self.feature_names_ = list(X.columns)
-            meta = (X.index, X.columns)
-            return X.values.tolist(), "pandas", meta
-        
-        if HAS_NUMPY and isinstance(X, np.ndarray):
-            meta = (X.dtype, X.shape)
-            return X.tolist(), "numpy", meta
-            
-        if isinstance(X, list):
-            meta = None
-            return X, "list", meta
-            
-        raise TypeError(f"Unsupported data type: {type(X)}. AMMI accepts pandas.DataFrame, numpy.ndarray, or List[List].")
+            orig_meta = (X.index.copy(), X.columns.copy(), X.dtypes.copy())
+            arr = X.to_numpy(dtype=np.float64, copy=True)
+            return arr, "pandas", orig_meta
 
-    def fit(self, X: Any, y: Any = None) -> 'AdaptiveMicroManifoldImputer':
-        """
-        Fit AMMI's global scale, random projections, and micro-manifold buckets.
-        """
-        X_list, _, _ = self._convert_input(X)
-        if not X_list or not X_list[0]:
-            raise ValueError("Input data cannot be empty.")
-
-        n_samples = len(X_list)
-        n_features = len(X_list[0])
-        rng = random.Random(self.seed)
-
-        # 1. Global Medians & Robust Standard Deviations
-        self.global_medians_ = []
-        self.global_stds_ = []
-        for c in range(n_features):
-            vals = [row[c] for row in X_list if not is_missing(row[c])]
-            if not vals:
-                self.global_medians_.append(0.0)
-                self.global_stds_.append(1.0)
+        if isinstance(X, np.ndarray):
+            orig_meta = (X.dtype, X.shape)
+            if not np.issubdtype(X.dtype, np.number):
+                try:
+                    arr = X.astype(np.float64)
+                except (ValueError, TypeError) as exc:
+                    raise ValueError("AMMI requires numerical feature matrices.") from exc
             else:
-                vals.sort()
-                k = len(vals)
-                median = float(vals[k // 2]) if k % 2 == 1 else (vals[k // 2 - 1] + vals[k // 2]) / 2.0
-                mean_v = sum(vals) / k
-                var_v = sum((v - mean_v) ** 2 for v in vals) / max(1, k - 1)
-                std = math.sqrt(var_v) or 1.0
-                self.global_medians_.append(median)
-                self.global_stds_.append(std)
+                arr = X.astype(np.float64, copy=True)
+            return arr, "numpy", orig_meta
 
-        # 2. Standardized baseline
-        X_norm = [
-            [
-                0.0 if is_missing(row[c]) else (row[c] - self.global_medians_[c]) / self.global_stds_[c]
-                for c in range(n_features)
-            ]
-            for row in X_list
-        ]
+        if isinstance(X, (list, tuple)):
+            try:
+                arr = np.array(X, dtype=np.float64)
+            except (ValueError, TypeError) as exc:
+                raise ValueError("AMMI requires numerical feature matrices.") from exc
+            return arr, "list", None
 
-        # 3. Unit Hyperplane Generation
-        R = [[rng.gauss(0.0, 1.0) for _ in range(self.n_projections)] for _ in range(n_features)]
-        self.projection_matrix_ = [[0.0] * self.n_projections for _ in range(n_features)]
-        for p in range(self.n_projections):
-            col_norm = math.sqrt(sum(R[f][p] ** 2 for f in range(n_features))) or 1.0
-            for f in range(n_features):
-                self.projection_matrix_[f][p] = R[f][p] / col_norm
+        raise TypeError(
+            f"Unsupported input type: {type(X)}. AMMI accepts pandas.DataFrame, "
+            f"numpy.ndarray, or nested lists/tuples."
+        )
+
+    def fit(self, X: Any, y: Any = None) -> "AdaptiveMicroManifoldImputer":
+        """
+        Fit the imputer on input dataset X.
+
+        Computes global marginal medians/scales, orthonormal projection basis,
+        quantile bin partitions, pairwise correlation matrix, and cell-level
+        empirical Bayes aggregates.
+
+        Parameters
+        ----------
+        X : {array-like, dataframe} of shape (n_samples, n_features)
+            The training input samples where missing values are represented as NaN.
+        y : Ignored
+            Not used, present for scikit-learn pipeline compatibility.
+
+        Returns
+        -------
+        self : object
+            Returns the instance itself.
+        """
+        X_arr, input_type, meta = self._convert_input(X)
+
+        if X_arr.ndim != 2:
+            raise ValueError(f"Expected 2D array, got {X_arr.ndim}D array instead.")
+
+        n_samples, n_features = X_arr.shape
+        if n_samples == 0 or n_features == 0:
+            raise ValueError("Input data matrix cannot be empty.")
+
+        self.n_features_in_ = n_features
+        if input_type == "pandas" and HAS_PANDAS:
+            _, cols, _ = meta
+            self.feature_names_in_ = np.array(cols, dtype=object)
+
+        # 1. Global Centrality and Scale Estimation
+        missing_mask = np.isnan(X_arr)
+        medians = np.zeros(n_features, dtype=np.float64)
+        stds = np.ones(n_features, dtype=np.float64)
+
+        for j in range(n_features):
+            col_valid = X_arr[~missing_mask[:, j], j]
+            if col_valid.size > 0:
+                med = float(np.median(col_valid))
+                std = float(np.std(col_valid, ddof=1)) if col_valid.size > 1 else 1.0
+                medians[j] = med
+                stds[j] = std if std > 1e-8 else 1.0
+            else:
+                medians[j] = 0.0
+                stds[j] = 1.0
+
+        self.global_medians_ = medians
+        self.global_stds_ = stds
+
+        # 2. Standardized Baseline Representation
+        # Fill missing values with median for geometry slicing
+        X_filled = np.where(missing_mask, self.global_medians_, X_arr)
+        Z = (X_filled - self.global_medians_) / self.global_stds_
+
+        # 3. Orthonormal Random Hyperplane Basis via QR Decomposition
+        effective_proj = min(self.n_projections, n_features)
+        rng = np.random.default_rng(self.random_state)
+        random_normals = rng.standard_normal((n_features, effective_proj))
+        q_basis, _ = np.linalg.qr(random_normals)
+        self.projection_matrix_ = q_basis
 
         # 4. Multi-Resolution Quantile Slicing
-        projected = self._project(X_norm)
+        projected = Z @ self.projection_matrix_  # shape: (n_samples, effective_proj)
         self.bin_edges_ = []
-        for p in range(self.n_projections):
-            p_vals = sorted(row[p] for row in projected)
-            self.bin_edges_.append([
-                p_vals[min(int((b / self.n_bins) * len(p_vals)), len(p_vals) - 1)]
-                for b in range(1, self.n_bins)
-            ])
+        quantiles_to_eval = np.linspace(0.0, 1.0, self.n_bins + 1)[1:-1]
+        for p in range(effective_proj):
+            col_p = projected[:, p]
+            edges = np.quantile(col_p, quantiles_to_eval)
+            # Ensure unique monotonically increasing edges
+            self.bin_edges_.append(edges)
 
-        # 5. Pearson Correlation Matrix (for Directed Residual Flow)
-        self.corr_matrix_ = [[0.0] * n_features for _ in range(n_features)]
-        for f1 in range(n_features):
-            for f2 in range(f1 + 1, n_features):
-                pairs = [(row[f1], row[f2]) for row in X_list if not is_missing(row[f1]) and not is_missing(row[f2])]
-                if len(pairs) > 2:
-                    m1 = sum(p[0] for p in pairs) / len(pairs)
-                    m2 = sum(p[1] for p in pairs) / len(pairs)
-                    cov = sum((p[0] - m1) * (p[1] - m2) for p in pairs)
-                    v1 = sum((p[0] - m1) ** 2 for p in pairs)
-                    v2 = sum((p[1] - m2) ** 2 for p in pairs)
-                    r = cov / math.sqrt(v1 * v2) if v1 > 0 and v2 > 0 else 0.0
-                else:
-                    r = 0.0
-                self.corr_matrix_[f1][f2] = r
-                self.corr_matrix_[f2][f1] = r
+        # 5. Pairwise Correlation Matrix
+        valid_mask = ~missing_mask
+        counts = valid_mask.T.astype(np.float64) @ valid_mask.astype(np.float64)
+        Z_masked = np.where(valid_mask, Z, 0.0)
+        cov = (Z_masked.T @ Z_masked) / np.maximum(counts - 1.0, 1.0)
+        diag = np.diag(cov)
+        denom = np.sqrt(np.outer(diag, diag))
+        corr = np.divide(
+            cov,
+            denom,
+            out=np.zeros_like(cov),
+            where=(denom > 1e-12) & (counts > 2.0),
+        )
+        np.fill_diagonal(corr, 1.0)
+        self.corr_matrix_ = np.clip(corr, -1.0, 1.0)
 
-        # 6. Micro-Manifold Cell Aggregations
-        hashes = self._hash(projected)
-        cell_sums: Dict[Tuple[int, ...], List[float]] = {}
-        self.cell_counts_ = {}
+        # 6. Micro-Manifold Cell Aggregation
+        bin_indices = np.zeros((n_samples, effective_proj), dtype=int)
+        for p in range(effective_proj):
+            bin_indices[:, p] = np.digitize(projected[:, p], self.bin_edges_[p])
 
-        for r_idx, h in enumerate(hashes):
-            if h not in cell_sums:
-                cell_sums[h] = [0.0] * n_features
-                self.cell_counts_[h] = [0] * n_features
-            for c in range(n_features):
-                val = X_list[r_idx][c]
-                if not is_missing(val):
-                    cell_sums[h][c] += val
-                    self.cell_counts_[h][c] += 1
+        cell_sums: Dict[Tuple[int, ...], np.ndarray] = {}
+        cell_counts: Dict[Tuple[int, ...], np.ndarray] = {}
 
-        self.cell_means_ = {
-            h: [sums[c] / self.cell_counts_[h][c] if self.cell_counts_[h][c] > 0 else self.global_medians_[c]
-                for c in range(n_features)]
-            for h, sums in cell_sums.items()
-        }
+        for i in range(n_samples):
+            key = tuple(bin_indices[i])
+            if key not in cell_sums:
+                cell_sums[key] = np.zeros(n_features, dtype=np.float64)
+                cell_counts[key] = np.zeros(n_features, dtype=np.int64)
+
+            for j in range(n_features):
+                if not missing_mask[i, j]:
+                    cell_sums[key][j] += X_arr[i, j]
+                    cell_counts[key][j] += 1
+
+        self.cell_counts_ = cell_counts
+        self.cell_means_ = {}
+        for key, sums in cell_sums.items():
+            counts_k = cell_counts[key]
+            means = np.where(counts_k > 0, sums / np.maximum(counts_k, 1), self.global_medians_)
+            self.cell_means_[key] = means
+
         return self
-
-    def _project(self, X_norm: List[List[float]]) -> List[List[float]]:
-        n_features = len(self.global_medians_)
-        return [
-            [sum(row[f] * self.projection_matrix_[f][p] for f in range(n_features)) for p in range(self.n_projections)]
-            for row in X_norm
-        ]
-
-    def _hash(self, projected: List[List[float]]) -> List[Tuple[int, ...]]:
-        hashes = []
-        for row in projected:
-            h = []
-            for p in range(self.n_projections):
-                val = row[p]
-                bin_idx = sum(1 for edge in self.bin_edges_[p] if val > edge)
-                h.append(bin_idx)
-            hashes.append(tuple(h))
-        return hashes
 
     def transform(self, X: Any) -> Any:
         """
-        Imputes missing values and returns the output in the same format as input
-        (Pandas DataFrame, NumPy array, or List).
+        Impute all missing values in X.
+
+        Parameters
+        ----------
+        X : {array-like, dataframe} of shape (n_samples, n_features)
+            The input data to impute.
+
+        Returns
+        -------
+        X_imputed : {ndarray, dataframe, list}
+            Transformed input with all missing values imputed in the original data structure.
         """
-        X_list, input_type, meta = self._convert_input(X)
-        n_features = len(self.global_medians_)
+        check_is_fitted(
+            self,
+            attributes=[
+                "global_medians_",
+                "global_stds_",
+                "projection_matrix_",
+                "bin_edges_",
+                "corr_matrix_",
+                "cell_means_",
+                "cell_counts_",
+            ],
+        )
 
-        X_norm = [
-            [
-                0.0 if is_missing(row[c]) else (row[c] - self.global_medians_[c]) / self.global_stds_[c]
-                for c in range(n_features)
-            ]
-            for row in X_list
-        ]
+        X_arr, input_type, meta = self._convert_input(X)
+        if X_arr.ndim != 2 or X_arr.shape[1] != self.n_features_in_:
+            raise ValueError(
+                f"Input has {X_arr.shape[1] if X_arr.ndim == 2 else 'non-2D'} features, "
+                f"but AMMI was fitted with {self.n_features_in_} features."
+            )
 
-        projected = self._project(X_norm)
-        hashes = self._hash(projected)
-        imputed_output = []
+        n_samples, n_features = X_arr.shape
+        missing_mask = np.isnan(X_arr)
 
-        for r_idx, row in enumerate(X_list):
-            imputed_row = list(row)
-            h = hashes[r_idx]
-            missing_cols = [c for c in range(n_features) if is_missing(row[c])]
-            observed_cols = [c for c in range(n_features) if not is_missing(row[c])]
+        # Fast path: no missing values present
+        if not np.any(missing_mask):
+            return self._format_output(X_arr, input_type, meta)
+
+        # Standardized coordinates
+        X_filled = np.where(missing_mask, self.global_medians_, X_arr)
+        Z = (X_filled - self.global_medians_) / self.global_stds_
+
+        # Project and determine cell coordinates
+        projected = Z @ self.projection_matrix_
+        effective_proj = self.projection_matrix_.shape[1]
+        bin_indices = np.zeros((n_samples, effective_proj), dtype=int)
+        for p in range(effective_proj):
+            bin_indices[:, p] = np.digitize(projected[:, p], self.bin_edges_[p])
+
+        X_out = X_arr.copy()
+
+        for i in range(n_samples):
+            missing_cols = np.flatnonzero(missing_mask[i])
+            if missing_cols.size == 0:
+                continue
+
+            observed_cols = np.flatnonzero(~missing_mask[i])
+            cell_key = tuple(bin_indices[i])
+
+            has_cell = cell_key in self.cell_means_
+            cell_means = self.cell_means_[cell_key] if has_cell else None
+            cell_counts = self.cell_counts_[cell_key] if has_cell else None
 
             for c in missing_cols:
-                # 1. James-Stein Shrinkage
-                if h in self.cell_means_:
-                    local_mean = self.cell_means_[h][c]
-                    cnt = self.cell_counts_[h][c]
-                    shrinkage = cnt / (cnt + self.shrinkage_tau)
-                    base_est = shrinkage * local_mean + (1.0 - shrinkage) * self.global_medians_[c]
+                # 1. Hierarchical Empirical Bayes Cell Shrinkage
+                if has_cell and cell_counts[c] > 0:
+                    cnt = cell_counts[c]
+                    weight = cnt / (cnt + self.shrinkage_tau)
+                    local_mean = cell_means[c]
                 else:
-                    base_est = self.global_medians_[c]
+                    weight = 0.0
+                    local_mean = self.global_medians_[c]
 
-                # 2. Directed Covariance Residual Flow
-                if observed_cols:
-                    cov_dot = sum(self.corr_matrix_[c][obs] * X_norm[r_idx][obs] for obs in observed_cols)
-                    sum_abs = sum(abs(self.corr_matrix_[c][obs]) for obs in observed_cols)
-                    residual_flow = (cov_dot / sum_abs) * self.global_stds_[c] if sum_abs > 1e-6 else 0.0
+                # 2. Correlation-Weighted Residual Projection Prior
+                if observed_cols.size > 0:
+                    corrs = self.corr_matrix_[c, observed_cols]
+                    z_obs = Z[i, observed_cols]
+                    sum_abs = np.sum(np.abs(corrs))
+                    if sum_abs > 1e-6:
+                        residual_flow = (np.dot(corrs, z_obs) / sum_abs) * self.global_stds_[c]
+                    else:
+                        residual_flow = 0.0
                 else:
                     residual_flow = 0.0
 
-                imputed_row[c] = base_est + residual_flow
+                # 3. Adaptive Blending: dense cells rely on local manifold geometry,
+                # sparse cells shrink toward global regularized covariance projection.
+                prior_estimate = self.global_medians_[c] + residual_flow
+                X_out[i, c] = weight * local_mean + (1.0 - weight) * prior_estimate
 
-            imputed_output.append(imputed_row)
+        return self._format_output(X_out, input_type, meta)
 
-        # Restore original input format
+    def _format_output(self, X_out: np.ndarray, input_type: str, meta: Any) -> Any:
+        """Restores the imputed array to the user's original data structure."""
         if input_type == "pandas" and HAS_PANDAS:
-            orig_index, orig_columns = meta
-            return pd.DataFrame(imputed_output, index=orig_index, columns=orig_columns)
-        
-        if input_type == "numpy" and HAS_NUMPY:
+            idx, cols, dtypes = meta
+            df_out = pd.DataFrame(X_out, index=idx, columns=cols)
+            # Attempt to preserve compatible original dtypes
+            for col in cols:
+                orig_dt = dtypes[col]
+                if not np.issubdtype(orig_dt, np.floating) and np.issubdtype(orig_dt, np.integer):
+                    df_out[col] = df_out[col].astype(np.float64)
+                else:
+                    try:
+                        df_out[col] = df_out[col].astype(orig_dt)
+                    except (ValueError, TypeError):
+                        pass
+            return df_out
+
+        if input_type == "numpy":
             orig_dtype, _ = meta
-            # Ensure float conversion for clean numerical data
             target_dtype = np.float64 if np.issubdtype(orig_dtype, np.integer) else orig_dtype
-            return np.array(imputed_output, dtype=target_dtype)
+            return X_out.astype(target_dtype)
 
-        return imputed_output
+        return X_out.tolist()
 
 
-# Alias for clean scientific import
+# Canonical alias for concise import
 AMMI = AdaptiveMicroManifoldImputer
