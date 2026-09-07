@@ -27,5 +27,5 @@ fast = ["numpy>=1.20.0", "pandas>=1.3.0"]
 all = ["numpy>=1.20.0", "pandas>=1.3.0", "scikit-learn>=1.0.0"]
 
 [project.urls]
-"Homepage" = "https://github.com/your-username/ammi-imputer"
-"Bug Tracker" = "https://github.com/your-username/ammi-imputer/issues"
+"Homepage" = "https://github.com/TuhinshubhraAtta/ammi"
+"Bug Tracker" = "https://github.com/TuhinshubhraAtta/ammi/issues"
